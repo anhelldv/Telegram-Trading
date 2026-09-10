@@ -1,7 +1,7 @@
 """
-TSC Backend v5.0
+TSC Backend v5.1
 Sistema de procesamiento de señales con IA
-Con soporte para licencias Supabase y heartbeat
+Con soporte para licencias Supabase, heartbeat y demo automática
 """
 
 import os
@@ -22,13 +22,13 @@ try:
     SUPABASE_AVAILABLE = True
 except ImportError:
     SUPABASE_AVAILABLE = False
-    print("⚠️ Supabase no instalado - usando licencia por variable de entorno")
+    print("WARNING: Supabase no instalado - usando licencia por variable de entorno")
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tsc")
 
-app = FastAPI(title="TSC Backend", version="5.0.0")
+app = FastAPI(title="TSC Backend", version="5.1.0")
 
 # CORS para permitir conexiones desde el companion app
 app.add_middleware(
@@ -49,7 +49,7 @@ GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 # Inicializar Groq
 if GROQ_API_KEY:
     groq_client = Groq(api_key=GROQ_API_KEY)
-    log.info("✅ Groq inicializado")
+    log.info("Groq inicializado")
 else:
     log.error("GROQ_API_KEY no configurada")
     groq_client = None
@@ -62,12 +62,12 @@ if SUPABASE_AVAILABLE:
     if supabase_url and supabase_key:
         try:
             supabase: Client = create_client(supabase_url, supabase_key)
-            log.info("✅ Supabase inicializado")
+            log.info("Supabase inicializado")
         except Exception as e:
             log.error(f"Error inicializando Supabase: {e}")
             supabase = None
     else:
-        log.warning("⚠️ Variables de Supabase no configuradas")
+        log.warning("Variables de Supabase no configuradas")
 
 # ================================================================
 # LISTAS BLANCAS
@@ -159,13 +159,16 @@ class HeartbeatRequest(BaseModel):
     status: str
     processed: int = 0
     errors: int = 0
-    version: str = "5.0.0"
+    version: str = "5.1.0"
 
 class LicenseStatus(BaseModel):
     status: str
     expires_at: Optional[str] = None
     current_activations: int = 0
     max_activations: int = 5
+
+class DemoLicenseRequest(BaseModel):
+    metaquotes_id: str
 
 # ================================================================
 # FUNCIONES DE LICENCIA
@@ -213,12 +216,10 @@ def check_license(license_key: str) -> bool:
                 expiry_str = lic["expires_at"]
                 if isinstance(expiry_str, str):
                     expiry = datetime.fromisoformat(expiry_str.replace("Z", "+00:00"))
-                    # Hacer timezone-aware si es necesario
                     if expiry.tzinfo is None:
                         expiry = expiry.replace(tzinfo=datetime.now().astimezone().tzinfo)
                     if datetime.now(expiry.tzinfo) > expiry:
                         log.warning(f"Licencia expirada: {license_key}")
-                        # Actualizar estado
                         try:
                             supabase.table("licenses")\
                                 .update({"status": "expired"})\
@@ -251,6 +252,81 @@ def check_license(license_key: str) -> bool:
     # Fallback: variable de entorno
     allowed = os.environ.get("VALID_LICENSE_KEYS", "")
     return license_key in [k.strip() for k in allowed.split(",") if k.strip()]
+
+def create_demo_license_for_metaquotes(metaquotes_id: str) -> dict:
+    """
+    Crea una licencia demo para un MetaQuotes ID.
+    Retorna un dict con success, license_key, expires_at, status, message.
+    """
+    metaquotes_id = metaquotes_id.strip().upper()
+    
+    if not metaquotes_id or len(metaquotes_id) < 6:
+        return {
+            "success": False,
+            "message": "Invalid MetaQuotes ID (must be at least 6 characters)"
+        }
+    
+    # Crear la clave de licencia demo
+    license_key = f"DEMO-{metaquotes_id}"
+    
+    # Si no hay Supabase, usar fallback
+    if not supabase:
+        expires_at = (datetime.now() + timedelta(days=14)).isoformat()
+        return {
+            "success": True,
+            "license_key": license_key,
+            "expires_at": expires_at,
+            "status": "active",
+            "message": "Demo created (fallback mode - no Supabase)"
+        }
+    
+    try:
+        # Verificar si ya existe
+        result = supabase.table("licenses")\
+            .select("*")\
+            .eq("key", license_key)\
+            .execute()
+        
+        if result.data:
+            lic = result.data[0]
+            return {
+                "success": True,
+                "license_key": license_key,
+                "expires_at": lic.get("expires_at"),
+                "status": lic.get("status"),
+                "message": "Demo already exists"
+            }
+        
+        # Crear nueva licencia demo (14 días)
+        expires_at = (datetime.now() + timedelta(days=14)).isoformat()
+        
+        supabase.table("licenses").insert({
+            "key": license_key,
+            "status": "active",
+            "customer_email": f"demo_{metaquotes_id}@tsc.app",
+            "customer_name": f"Demo User {metaquotes_id}",
+            "notes": f"Demo license for MetaQuotes ID: {metaquotes_id}",
+            "plan": "demo",
+            "expires_at": expires_at,
+            "max_activations": 1
+        }).execute()
+        
+        log.info(f"Demo license created: {license_key}")
+        
+        return {
+            "success": True,
+            "license_key": license_key,
+            "expires_at": expires_at,
+            "status": "active",
+            "message": "Demo license created successfully"
+        }
+        
+    except Exception as e:
+        log.error(f"Error creating demo license: {e}")
+        return {
+            "success": False,
+            "message": f"Error creating demo license: {str(e)}"
+        }
 
 # ================================================================
 # ENDPOINTS
@@ -323,7 +399,6 @@ def heartbeat(req: HeartbeatRequest):
     if not check_license(req.license_key):
         raise HTTPException(status_code=403, detail="Invalid license")
     
-    # Actualizar en Supabase si esta disponible
     if supabase:
         try:
             supabase.table("licenses")\
@@ -344,12 +419,10 @@ def heartbeat(req: HeartbeatRequest):
 def get_license_status(license_key: str):
     """Obtiene el estado de una licencia (sin verificar, para el companion)"""
     
-    # Obtener licencia de Supabase
     if supabase:
         lic = get_license_from_supabase(license_key)
         
         if lic is None:
-            # Fallback a variable de entorno
             allowed = os.environ.get("VALID_LICENSE_KEYS", "")
             if license_key in [k.strip() for k in allowed.split(",") if k.strip()]:
                 return {
@@ -362,10 +435,8 @@ def get_license_status(license_key: str):
                 }
             raise HTTPException(status_code=404, detail="License not found")
         
-        # Verificar estado
         status = lic.get("status", "unknown")
         
-        # Verificar expiracion
         if status == "active" and lic.get("expires_at"):
             try:
                 expiry_str = lic["expires_at"]
@@ -394,7 +465,6 @@ def get_license_status(license_key: str):
             "message": f"License status: {status}"
         }
     
-    # Sin Supabase
     allowed = os.environ.get("VALID_LICENSE_KEYS", "")
     if license_key in [k.strip() for k in allowed.split(",") if k.strip()]:
         return {
@@ -408,12 +478,31 @@ def get_license_status(license_key: str):
     
     raise HTTPException(status_code=404, detail="License not found")
 
+@app.post("/create_demo_license")
+def create_demo_license(req: DemoLicenseRequest):
+    """Crea una licencia demo para un MetaQuotes ID"""
+    
+    result = create_demo_license_for_metaquotes(req.metaquotes_id)
+    
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=400,
+            detail=result.get("message", "Error creating demo license")
+        )
+    
+    return {
+        "license_key": result.get("license_key"),
+        "expires_at": result.get("expires_at"),
+        "status": result.get("status"),
+        "message": result.get("message")
+    }
+
 @app.get("/health")
 def health():
     """Health check para Render"""
     return {
         "status": "ok",
-        "version": "5.0.0",
+        "version": "5.1.0",
         "supabase": "connected" if supabase else "not_configured",
         "groq": "connected" if groq_client else "not_configured"
     }
@@ -423,7 +512,13 @@ def root():
     """Raiz del servicio"""
     return {
         "service": "TSC Backend",
-        "version": "5.0.0",
+        "version": "5.1.0",
         "status": "online",
-        "endpoints": ["/health", "/parse", "/heartbeat", "/license_status"]
+        "endpoints": [
+            "/health",
+            "/parse",
+            "/heartbeat",
+            "/license_status",
+            "/create_demo_license"
+        ]
     }
