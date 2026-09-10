@@ -1,5 +1,5 @@
 """
-TSC Backend v3.0
+TSC Backend v5.0
 Sistema de procesamiento de señales con IA
 Con soporte para licencias Supabase y heartbeat
 """
@@ -28,7 +28,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tsc")
 
-app = FastAPI(title="TSC Backend", version="3.0.0")
+app = FastAPI(title="TSC Backend", version="5.0.0")
 
 # CORS para permitir conexiones desde el companion app
 app.add_middleware(
@@ -49,22 +49,25 @@ GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 # Inicializar Groq
 if GROQ_API_KEY:
     groq_client = Groq(api_key=GROQ_API_KEY)
+    log.info("✅ Groq inicializado")
 else:
     log.error("GROQ_API_KEY no configurada")
     groq_client = None
 
 # Inicializar Supabase si esta disponible
+supabase = None
 if SUPABASE_AVAILABLE:
     supabase_url = os.environ.get("SUPABASE_URL")
     supabase_key = os.environ.get("SUPABASE_KEY")
     if supabase_url and supabase_key:
-        supabase: Client = create_client(supabase_url, supabase_key)
-        log.info("✅ Supabase inicializado")
+        try:
+            supabase: Client = create_client(supabase_url, supabase_key)
+            log.info("✅ Supabase inicializado")
+        except Exception as e:
+            log.error(f"Error inicializando Supabase: {e}")
+            supabase = None
     else:
-        SUPABASE_AVAILABLE = False
         log.warning("⚠️ Variables de Supabase no configuradas")
-else:
-    supabase = None
 
 # ================================================================
 # LISTAS BLANCAS
@@ -156,65 +159,94 @@ class HeartbeatRequest(BaseModel):
     status: str
     processed: int = 0
     errors: int = 0
-    version: str = "3.0.0"
+    version: str = "5.0.0"
 
 class LicenseStatus(BaseModel):
     status: str
     expires_at: Optional[str] = None
     current_activations: int = 0
-    max_activations: int = 3
+    max_activations: int = 5
 
 # ================================================================
 # FUNCIONES DE LICENCIA
 # ================================================================
 
+def get_license_from_supabase(license_key: str) -> Optional[dict]:
+    """Obtiene una licencia de Supabase"""
+    if not supabase:
+        return None
+    
+    try:
+        result = supabase.table("licenses")\
+            .select("*")\
+            .eq("key", license_key)\
+            .execute()
+        
+        if result.data and len(result.data) > 0:
+            return result.data[0]
+        return None
+    except Exception as e:
+        log.error(f"Error obteniendo licencia de Supabase: {e}")
+        return None
+
 def check_license(license_key: str) -> bool:
     """Verifica la licencia (Supabase o variable de entorno)"""
     
     # Si Supabase esta disponible, usarlo
-    if SUPABASE_AVAILABLE and supabase:
+    if supabase:
+        lic = get_license_from_supabase(license_key)
+        
+        if lic is None:
+            log.warning(f"Licencia no encontrada en Supabase: {license_key}")
+            # Fallback a variable de entorno
+            allowed = os.environ.get("VALID_LICENSE_KEYS", "")
+            return license_key in [k.strip() for k in allowed.split(",") if k.strip()]
+        
+        # Verificar estado
+        if lic.get("status") != "active":
+            log.warning(f"Licencia inactiva: {license_key} (status: {lic.get('status')})")
+            return False
+        
+        # Verificar expiracion
+        if lic.get("expires_at"):
+            try:
+                expiry_str = lic["expires_at"]
+                if isinstance(expiry_str, str):
+                    expiry = datetime.fromisoformat(expiry_str.replace("Z", "+00:00"))
+                    # Hacer timezone-aware si es necesario
+                    if expiry.tzinfo is None:
+                        expiry = expiry.replace(tzinfo=datetime.now().astimezone().tzinfo)
+                    if datetime.now(expiry.tzinfo) > expiry:
+                        log.warning(f"Licencia expirada: {license_key}")
+                        # Actualizar estado
+                        try:
+                            supabase.table("licenses")\
+                                .update({"status": "expired"})\
+                                .eq("key", license_key)\
+                                .execute()
+                        except:
+                            pass
+                        return False
+            except Exception as e:
+                log.error(f"Error verificando expiracion: {e}")
+        
+        # Verificar activaciones
+        max_activations = lic.get("max_activations", 5)
+        current = lic.get("current_activations", 0)
+        if current >= max_activations:
+            log.warning(f"Limite de activaciones alcanzado: {license_key}")
+            return False
+        
+        # Actualizar ultimo uso
         try:
-            result = supabase.table("licenses")\
-                .select("*")\
-                .eq("key", license_key)\
-                .execute()
-            
-            if not result.data:
-                log.warning(f"Licencia no encontrada: {license_key}")
-                return False
-            
-            license_data = result.data[0]
-            
-            # Verificar estado
-            if license_data.get("status") != "active":
-                log.warning(f"Licencia inactiva: {license_key}")
-                return False
-            
-            # Verificar expiracion
-            if license_data.get("expires_at"):
-                expiry = datetime.fromisoformat(license_data["expires_at"].replace("Z", "+00:00"))
-                if datetime.now() > expiry:
-                    log.warning(f"Licencia expirada: {license_key}")
-                    return False
-            
-            # Verificar activaciones
-            max_activations = license_data.get("max_activations", 3)
-            current = license_data.get("current_activations", 0)
-            if current >= max_activations:
-                log.warning(f"Limite de activaciones alcanzado: {license_key}")
-                return False
-            
-            # Actualizar ultimo uso
             supabase.table("licenses")\
                 .update({"last_used_at": datetime.now().isoformat()})\
                 .eq("key", license_key)\
                 .execute()
-            
-            return True
-            
         except Exception as e:
-            log.error(f"Error verificando licencia en Supabase: {e}")
-            # Fallback a variable de entorno
+            log.error(f"Error actualizando last_used_at: {e}")
+        
+        return True
     
     # Fallback: variable de entorno
     allowed = os.environ.get("VALID_LICENSE_KEYS", "")
@@ -234,7 +266,7 @@ def parse(req: ParseRequest):
     
     # Verificar Groq
     if not groq_client:
-        raise HTTPException(status_code=503, detail="IA no disponible")
+        raise HTTPException(status_code=503, detail="AI service unavailable")
     
     # Procesar con IA
     try:
@@ -249,12 +281,12 @@ def parse(req: ParseRequest):
         )
         
         raw = completion.choices[0].message.content
-        log.info(f"Respuesta de IA: {raw[:200]}...")
+        log.info(f"AI response: {raw[:200]}...")
         
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            log.warning(f"IA devolvio JSON invalido: {raw}")
+            log.warning(f"Invalid JSON: {raw}")
             return ParseResponse(valid=False)
         
         # Validar
@@ -266,11 +298,11 @@ def parse(req: ParseRequest):
         action = data.get("action")
         
         if symbol not in ALLOWED_SYMBOLS:
-            log.info(f"Simbolo no permitido: {symbol}")
+            log.info(f"Symbol not allowed: {symbol}")
             return ParseResponse(valid=False)
         
         if action not in ALLOWED_ACTIONS or action == "NONE":
-            log.info(f"Accion no permitida: {action}")
+            log.info(f"Action not allowed: {action}")
             return ParseResponse(valid=False)
         
         # Normalizar numeros
@@ -281,8 +313,8 @@ def parse(req: ParseRequest):
         return ParseResponse(valid=True, signal=data)
         
     except Exception as e:
-        log.error(f"Error en parse: {e}")
-        raise HTTPException(status_code=500, detail="Error procesando la señal")
+        log.error(f"Parse error: {e}")
+        raise HTTPException(status_code=500, detail="Error processing signal")
 
 @app.post("/heartbeat")
 def heartbeat(req: HeartbeatRequest):
@@ -292,12 +324,11 @@ def heartbeat(req: HeartbeatRequest):
         raise HTTPException(status_code=403, detail="Invalid license")
     
     # Actualizar en Supabase si esta disponible
-    if SUPABASE_AVAILABLE and supabase:
+    if supabase:
         try:
             supabase.table("licenses")\
                 .update({
                     "last_heartbeat": datetime.now().isoformat(),
-                    "status": req.status,
                     "processed_count": req.processed,
                     "error_count": req.errors,
                     "version": req.version
@@ -305,48 +336,94 @@ def heartbeat(req: HeartbeatRequest):
                 .eq("key", req.license_key)\
                 .execute()
         except Exception as e:
-            log.error(f"Error actualizando heartbeat: {e}")
+            log.error(f"Error updating heartbeat: {e}")
     
     return {"status": "ok", "timestamp": req.timestamp}
 
 @app.get("/license_status")
 def get_license_status(license_key: str):
-    """Obtiene el estado de una licencia"""
+    """Obtiene el estado de una licencia (sin verificar, para el companion)"""
     
-    if not check_license(license_key):
-        raise HTTPException(status_code=403, detail="Invalid license")
+    # Obtener licencia de Supabase
+    if supabase:
+        lic = get_license_from_supabase(license_key)
+        
+        if lic is None:
+            # Fallback a variable de entorno
+            allowed = os.environ.get("VALID_LICENSE_KEYS", "")
+            if license_key in [k.strip() for k in allowed.split(",") if k.strip()]:
+                return {
+                    "status": "active",
+                    "expires_at": None,
+                    "current_activations": 0,
+                    "max_activations": 5,
+                    "plan": "basic",
+                    "message": "License valid (fallback mode)"
+                }
+            raise HTTPException(status_code=404, detail="License not found")
+        
+        # Verificar estado
+        status = lic.get("status", "unknown")
+        
+        # Verificar expiracion
+        if status == "active" and lic.get("expires_at"):
+            try:
+                expiry_str = lic["expires_at"]
+                if isinstance(expiry_str, str):
+                    expiry = datetime.fromisoformat(expiry_str.replace("Z", "+00:00"))
+                    if expiry.tzinfo is None:
+                        expiry = expiry.replace(tzinfo=datetime.now().astimezone().tzinfo)
+                    if datetime.now(expiry.tzinfo) > expiry:
+                        status = "expired"
+                        try:
+                            supabase.table("licenses")\
+                                .update({"status": "expired"})\
+                                .eq("key", license_key)\
+                                .execute()
+                        except:
+                            pass
+            except Exception as e:
+                log.error(f"Error checking expiry: {e}")
+        
+        return {
+            "status": status,
+            "expires_at": lic.get("expires_at"),
+            "current_activations": lic.get("current_activations", 0),
+            "max_activations": lic.get("max_activations", 5),
+            "plan": lic.get("plan", "basic"),
+            "message": f"License status: {status}"
+        }
     
-    if SUPABASE_AVAILABLE and supabase:
-        try:
-            result = supabase.table("licenses")\
-                .select("status, expires_at, current_activations, max_activations")\
-                .eq("key", license_key)\
-                .execute()
-            
-            if result.data:
-                data = result.data[0]
-                return LicenseStatus(
-                    status=data.get("status", "unknown"),
-                    expires_at=data.get("expires_at"),
-                    current_activations=data.get("current_activations", 0),
-                    max_activations=data.get("max_activations", 3)
-                )
-        except Exception as e:
-            log.error(f"Error obteniendo estado: {e}")
+    # Sin Supabase
+    allowed = os.environ.get("VALID_LICENSE_KEYS", "")
+    if license_key in [k.strip() for k in allowed.split(",") if k.strip()]:
+        return {
+            "status": "active",
+            "expires_at": None,
+            "current_activations": 0,
+            "max_activations": 5,
+            "plan": "basic",
+            "message": "License valid (env mode)"
+        }
     
-    return {"status": "active", "expires_at": None, "current_activations": 1, "max_activations": 3}
+    raise HTTPException(status_code=404, detail="License not found")
 
 @app.get("/health")
 def health():
     """Health check para Render"""
-    return {"status": "ok", "version": "3.0.0"}
+    return {
+        "status": "ok",
+        "version": "5.0.0",
+        "supabase": "connected" if supabase else "not_configured",
+        "groq": "connected" if groq_client else "not_configured"
+    }
 
 @app.get("/")
 def root():
     """Raiz del servicio"""
     return {
         "service": "TSC Backend",
-        "version": "3.0.0",
+        "version": "5.0.0",
         "status": "online",
         "endpoints": ["/health", "/parse", "/heartbeat", "/license_status"]
     }
