@@ -271,7 +271,7 @@ def create_demo_license_for_metaquotes(metaquotes_id: str) -> dict:
     
     # Si no hay Supabase, usar fallback
     if not supabase:
-        expires_at = (datetime.now() + timedelta(days=14)).isoformat()
+        expires_at = (datetime.now() + timedelta(days=3)).isoformat()
         return {
             "success": True,
             "license_key": license_key,
@@ -298,7 +298,7 @@ def create_demo_license_for_metaquotes(metaquotes_id: str) -> dict:
             }
         
         # Crear nueva licencia demo (14 días)
-        expires_at = (datetime.now() + timedelta(days=14)).isoformat()
+        expires_at = (datetime.now() + timedelta(days=3)).isoformat()
         
         supabase.table("licenses").insert({
             "key": license_key,
